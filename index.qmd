@@ -1,0 +1,178 @@
+---
+title: "Scholarly Migration Database"
+format:
+  html:
+    code-fold: true
+editor: visual
+---
+
+## Loading Packages and Data
+
+This document explores international scholarly migration flows using Scopus data.
+
+```{r}
+library(sf)
+library(spData)
+library(countrycode)
+library(flowmapper)
+library(tidyverse)
+```
+
+Load the Scopus migration data.
+
+```{r}
+scopus_migration <- read_csv(
+  "data_processed/scopus_2024_V1_scholarlymigration_countryflows_enriched.csv"
+)
+```
+
+## Data Preparation
+
+Prepare country-level geographical information and convert country codes from ISO-3 to ISO-2.
+
+```{r}
+countries <- spData::world
+
+scopus_migration <- scopus_migration %>%
+  mutate(
+    iso2codefrom = countrycode(
+      iso3codefrom,
+      origin = "iso3c",
+      destination = "iso2c"
+    ),
+    iso2codeto = countrycode(
+      iso3codeto,
+      origin = "iso3c",
+      destination = "iso2c"
+    )
+  )
+
+countries_locations <- countries %>%
+  st_transform(8857) %>%
+  st_point_on_surface() %>%
+  st_transform(4326) %>%
+  mutate(
+    lon = st_coordinates(geom)[, 1],
+    lat = st_coordinates(geom)[, 2]
+  ) %>%
+  st_drop_geometry() %>%
+  select(
+    name = iso_a2,
+    x = lon,
+    y = lat
+  )
+```
+
+## Mapping Scholarly Migration Flows
+
+Aggregate migration flows between origin and destination countries across the study period.
+
+```{r}
+scopus_flows <- scopus_migration %>%
+  group_by(
+    o = iso2codefrom,
+    d = iso2codeto
+  ) %>%
+  summarise(
+    value = sum(n_migrations, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(
+    !is.na(o),
+    !is.na(d),
+    o != d
+  ) %>%
+  semi_join(countries_locations, by = c("o" = "name")) %>%
+  semi_join(countries_locations, by = c("d" = "name"))
+```
+
+### Global Scholarly Migration Network
+
+The following map illustrates the geographical structure of scholarly migration flows, with countries grouped into spatial clusters.
+
+```{r}
+p <- ggplot() +
+  geom_sf(
+    data = countries,
+    fill = "grey95",
+    color = "white"
+  )
+
+world_map <- add_flowmap(
+  p = p,
+  nodes = countries_locations,
+  od = scopus_flows,
+  k_nodes = 10
+)
+
+world_map
+```
+
+## Country-Level Net Migration Balance
+
+Calculate total incoming and outgoing scholarly migration flows and their net balance for each country.
+
+```{r}
+country_flows <- bind_rows(
+  scopus_flows %>%
+    group_by(country = o) %>%
+    summarise(outflows = sum(value), .groups = "drop"),
+
+  scopus_flows %>%
+    group_by(country = d) %>%
+    summarise(inflows = sum(value), .groups = "drop")
+) %>%
+  group_by(country) %>%
+  summarise(
+    outflows = sum(outflows, na.rm = TRUE),
+    inflows = sum(inflows, na.rm = TRUE),
+    net_flow = inflows - outflows,
+    .groups = "drop"
+  )
+
+country_flows <- country_flows %>%
+  left_join(
+    countries %>%
+      st_drop_geometry() %>%
+      select(country = iso_a2, country_name = name_long),
+    by = "country"
+  ) %>%
+  select(country_name, inflows, outflows, net_flow)
+```
+
+### Net Scholarly Migration by Country
+
+The chart presents the 20 countries with the largest absolute net scholarly migration balances. Positive values indicate net receivers, while negative values indicate net senders.
+
+```{r}
+top_net <- country_flows %>%
+  arrange(desc(abs(net_flow))) %>%
+  slice_head(n = 20) %>%
+  mutate(
+    country_name = reorder(country_name, net_flow)
+  )
+
+ggplot(
+  top_net,
+  aes(
+    x = country_name,
+    y = net_flow,
+    fill = net_flow > 0
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  geom_hline(yintercept = 0, color = "black") +
+  scale_fill_manual(
+    values = c("TRUE" = "steelblue", "FALSE" = "indianred"),
+    labels = c("FALSE" = "Net sender", "TRUE" = "Net receiver")
+  ) +
+  labs(
+    title = "Net Scholarly Migration by Country",
+    subtitle = "Aggregated Scopus flows across the study period",
+    x = NULL,
+    y = "Net migration balance (inflows - outflows)",
+    fill = NULL
+  ) +
+  theme_minimal()
+```

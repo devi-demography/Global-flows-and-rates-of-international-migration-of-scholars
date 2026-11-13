@@ -1,0 +1,227 @@
+---
+title: "Scholarly Migration Database"
+format: html
+editor: visual
+---
+
+## Loading Packages and Data
+
+Load the necessary packages to visualise the migration database.
+
+```{r}
+library(sf)
+library(spData)
+library(countrycode)
+library(flowmapblue)
+library(flowmapper)
+
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+```
+
+Load the data
+
+```{r}
+
+openAlex_migration <- read_csv("data_processed/openalex_2024_V1_scholarlymigration_countryflows_enriched.csv")
+
+scopus_migration <- read_csv("data_processed/scopus_2024_V1_scholarlymigration_countryflows_enriched.csv")
+```
+
+## Data Preparation and Mapping
+
+```{r}
+countries <- spData::world
+glimpse(countries)
+
+countries %>% ggplot() + geom_sf()
+
+ggplot() + geom_sf(data = countries) + geom_sf(data = st_point_on_surface(countries), color = "darkred")
+
+```
+
+Country Codes
+
+```{r}
+
+library(countrycode)
+
+scopus_migration <- scopus_migration %>% 
+  mutate(
+    iso2codefrom = countrycode(iso3codefrom,
+          origin = "iso3c",
+          destination = "iso2c"),
+    iso2codeto = countrycode(iso3codeto,
+           origin = "iso3c",
+           destination = "iso2c")
+  )
+
+```
+
+First, we will visualise the migration flow using flowmapper. This is a static flow map
+
+```{r}
+
+names(scopus_migration)
+glimpse(scopus_migration)
+
+
+countries_locations <- countries %>% 
+  st_transform(8857) %>% 
+  st_point_on_surface() %>% 
+  st_transform(4326) %>% 
+  mutate(
+    lon = st_coordinates(geom)[, 1],
+    lat = st_coordinates(geom)[, 2]
+  ) %>% 
+  st_drop_geometry() %>% 
+  select(
+    name = iso_a2,
+    x = lon,
+    y = lat
+  )
+
+glimpse(countries_locations)
+head(countries_locations)
+```
+
+```{r}
+scopus_flows <- scopus_migration %>% 
+  group_by(
+    o = iso2codefrom,
+    d = iso2codeto
+  ) %>% 
+  summarise(
+    value = sum(n_migrations, na.rm = TRUE),
+    .groups = "drop"
+  ) %>% 
+  filter(
+    !is.na(o),
+    !is.na(d),
+    o != d
+  ) %>% 
+  semi_join(countries_locations, by = c("o" = "name")) %>% 
+  semi_join(countries_locations, by = c("d" = "name"))
+
+glimpse(scopus_flows)
+head(scopus_flows, 10)
+```
+
+Now, let us plot
+
+```{r}
+library(flowmapper)
+
+p <- ggplot() +
+  geom_sf(
+    data = countries,
+    fill = "grey95",
+    color = "white"
+  )
+
+world_map <- add_flowmap(
+  p = p,
+  nodes = countries_locations,
+  od = scopus_flows,
+  k_nodes = 10
+)
+
+world_map
+
+```
+
+Let us also idntify the top 20 migration flows\
+
+```{r}
+top_flows <- scopus_flows %>%
+  left_join(
+    countries %>%
+      st_drop_geometry() %>%
+      select(o = iso_a2, origin = name_long),
+    by = "o"
+  ) %>%
+  left_join(
+    countries %>%
+      st_drop_geometry() %>%
+      select(d = iso_a2, destination = name_long),
+    by = "d"
+  ) %>%
+  arrange(desc(value)) %>%
+  slice_head(n = 20) %>%
+  select(origin, destination, value)
+
+top_flows
+```
+
+```{r}
+country_flows <- bind_rows(
+  scopus_flows %>%
+    group_by(country = o) %>%
+    summarise(outflows = sum(value), .groups = "drop"),
+
+  scopus_flows %>%
+    group_by(country = d) %>%
+    summarise(inflows = sum(value), .groups = "drop")
+) %>%
+  group_by(country) %>%
+  summarise(
+    outflows = sum(outflows, na.rm = TRUE),
+    inflows = sum(inflows, na.rm = TRUE),
+    net_flow = inflows - outflows,
+    .groups = "drop"
+  )
+
+
+
+country_flows <- country_flows %>%
+  left_join(
+    countries %>%
+      st_drop_geometry() %>%
+      select(country = iso_a2, country_name = name_long),
+    by = "country"
+  ) %>%
+  select(country_name, inflows, outflows, net_flow)
+
+country_flows %>%
+  arrange(desc(net_flow)) %>%
+  slice_head(n = 10)
+
+country_flows %>%
+  arrange(net_flow) %>%
+  slice_head(n = 10)
+```
+
+Visualize the net migration balance
+
+```{r}
+top_net <- country_flows %>%
+  arrange(desc(abs(net_flow))) %>%
+  slice_head(n = 20) %>%
+  mutate(
+    country_name = reorder(country_name, net_flow)
+  )
+
+ggplot(top_net, aes(x = country_name, y = net_flow,
+                    fill = net_flow > 0)) +
+  geom_col() +
+  coord_flip() +
+  geom_hline(yintercept = 0, color = "black") +
+  scale_fill_manual(
+    values = c("TRUE" = "steelblue", "FALSE" = "indianred"),
+    labels = c("FALSE" = "Net sender", "TRUE" = "Net receiver")
+  ) +
+  labs(
+    title = "Net Scholarly Migration by Country",
+    subtitle = "Aggregated Scopus flows across the study period",
+    x = NULL,
+    y = "Net migration balance (inflows - outflows)",
+    fill = NULL
+  ) +
+  theme_minimal()
+```
+
+\
+
+\
+\
